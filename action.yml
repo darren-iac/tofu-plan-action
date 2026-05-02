@@ -96,7 +96,6 @@ runs:
 
     - name: Plan + comment per workspace
       id: run
-      shell: bash
       env:
         WORKSPACES: ${{ steps.detect.outputs.workspaces }}
         TOFU_ROOT: ${{ inputs.tofu-root }}
