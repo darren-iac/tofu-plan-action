@@ -98,6 +98,10 @@ A failure on one workspace doesn't skip planning the others — every changed wo
 
 `vN` floats to the latest minor/patch on that major. Pin to `@v1` for current behavior.
 
+## Troubleshooting
+
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — common bugs hit while building / extending this action (composite-action `-e` defaults, heredoc closer indentation, GITHUB_* env collisions, multi-value `git config insteadOf`, lease cascade-revoke, etc.).
+
 ## License
 
 Apache-2.0.
