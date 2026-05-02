@@ -104,11 +104,15 @@ runs:
         PR: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      # Override GHA's default `bash -e -o pipefail` — we explicitly want
+      # `tofu plan` to be able to exit non-zero (changes detected = exit 2,
+      # plan errors = exit 1) without killing the loop before it can post
+      # the comment. Setting flags via shell: rather than `set +e` inside
+      # the script because GHA injects -e in the shell invocation itself,
+      # before any of our `set` commands run.
+      shell: 'bash --noprofile --norc -uo pipefail {0}'
       run: |
-        # Intentionally NOT `set -e` — we want to keep iterating on
-        # workspace failures so every workspace gets a comment, even if
-        # one of them errors out.
-        set -uo pipefail
+        # -e is OFF (see shell: above) — we keep iterating per-workspace.
         ROOT="${TOFU_ROOT%/}"
         FAILED_OVERALL=0
 
