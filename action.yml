@@ -55,14 +55,26 @@ runs:
         if [ -n "$EXPLICIT" ]; then
           WS=$(echo "$EXPLICIT" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort -u | grep -v '^$' || true)
         elif [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+          # For each changed file under tofu-root, walk up the directory
+          # tree looking for backend.tf — that's the workspace root.
+          # Workspace identifier is the path relative to tofu-root, e.g.:
+          #   tofu/coder/main.tf                    → coder
+          #   tofu/slack/sleepless_agent/main.tf    → slack/sleepless_agent
+          # This handles arbitrarily-nested workspace layouts. Files
+          # whose parent chain has no backend.tf (e.g. modules under a
+          # workspace's sub-dir) are silently ignored — they don't
+          # define their own workspace.
           WS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- "$ROOT/" \
-            | awk -v root="$ROOT" '
-                {
-                  sub("^"root"/", "", $0)
-                  split($0, parts, "/")
-                  if (parts[1] != "") print parts[1]
-                }
-              ' \
+            | while IFS= read -r f; do
+                d=$(dirname "$f")
+                while [ "$d" != "." ] && [ "$d" != "/" ] && [ "$d" != "$ROOT" ]; do
+                  if [ -f "$d/backend.tf" ]; then
+                    echo "${d#${ROOT}/}"
+                    break
+                  fi
+                  d=$(dirname "$d")
+                done
+              done \
             | sort -u)
         else
           echo "::warning::Not running on a pull_request event and no explicit `workspaces` input — nothing to plan."
