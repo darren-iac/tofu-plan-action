@@ -170,21 +170,23 @@ runs:
             esac
 
             MARKER="<!-- tofu-plan-action: $WS -->"
-            BODY=$(cat <<EOF_COMMENT
-        $MARKER
+            # Build the comment body without a heredoc — heredoc closing
+            # delimiters must be at column 0 in bash, which doesn't work
+            # cleanly inside the YAML-indented `run:` script. Plain
+            # multi-line string is robust.
+            PLAN_OUTPUT=$(cat /tmp/plan-final.txt)
+            BODY="$MARKER
         ### $EMOJI \`tofu plan\` — \`$WS\` — $SUMMARY
 
         <details><summary>Plan output</summary>
 
         \`\`\`hcl
-        $(cat /tmp/plan-final.txt)
+        $PLAN_OUTPUT
         \`\`\`
 
         </details>
 
-        <sub>Posted by [tofu-plan-action](https://github.com/darren-iac/tofu-plan-action) for commit \`$HEAD_SHA\`.</sub>
-        EOF_COMMENT
-            )
+        <sub>Posted by [tofu-plan-action](https://github.com/darren-iac/tofu-plan-action) for commit \`$HEAD_SHA\`.</sub>"
 
             # Use curl + python3 (universally available on GHA runners
             # incl. ARC images) instead of gh CLI which isn't installed
