@@ -127,12 +127,17 @@ runs:
             cd "$DIR"
 
             STATUS=0
-            if ! tofu init -input=false -no-color 2>&1 | tee /tmp/init.txt; then
+            # `-lock=false` on both init and plan: PR-time plans are
+            # read-only, multiple concurrent plans on different PRs are
+            # safe, and skipping the lock means the action can run
+            # without DynamoDB perms (S3 read on the state bucket is
+            # enough for plan).
+            if ! tofu init -input=false -no-color -lock=false 2>&1 | tee /tmp/init.txt; then
               STATUS=255
               cp /tmp/init.txt /tmp/plan.txt
               echo "[init failed — see init output above]" >> /tmp/plan.txt
             else
-              tofu plan -no-color -detailed-exitcode -input=false 2>&1 | tee /tmp/plan.txt
+              tofu plan -no-color -detailed-exitcode -input=false -lock=false 2>&1 | tee /tmp/plan.txt
               STATUS=${PIPESTATUS[0]}
             fi
 
