@@ -1,0 +1,194 @@
+name: tofu-plan
+
+# Reusable workflow that runs `tofu plan` for every workspace touched by a
+# pull request and posts the diff as a PR comment per workspace. Designed
+# for the OpenTofu monorepo pattern where each `<tofu-root>/<workspace>/`
+# directory is an independent workspace with its own backend.
+#
+# Caller contract:
+#
+#   permissions:
+#     pull-requests: write   # to post the plan comment
+#     contents: read
+#
+#   jobs:
+#     plan:
+#       uses: darren-iac/tofu-plan-action/.github/workflows/plan.yaml@v0
+#       with:
+#         tofu-root: tofu/        # default; trailing slash optional
+#         runner: ubuntu-latest   # override to e.g. arc-runner-darren-iac
+#         tofu-version: latest    # default
+#       secrets: inherit          # passes through GITHUB_TOKEN
+#
+# Credentials for the `tofu plan` itself (cloud providers, github provider,
+# etc.) must be on the runner — this workflow does not mint them. For the
+# darren-iac/iac use case, arc-runner-darren-iac mounts vault-agent-rendered
+# credential files at /vault/secrets/* via OpenBao K8s auth, and the tofu
+# providers in each workspace read from those files (see
+# https://github.com/darren-iac/iac/blob/main/tofu/coder/providers.tf for an
+# example).
+
+on:
+  workflow_call:
+    inputs:
+      tofu-root:
+        description: 'Root directory containing tofu workspaces (relative to repo root). Trailing slash optional.'
+        type: string
+        default: 'tofu/'
+      runner:
+        description: 'Runner label for the plan jobs. The detect job always runs on ubuntu-latest.'
+        type: string
+        default: 'ubuntu-latest'
+      tofu-version:
+        description: 'OpenTofu version to install on the runner (passed to opentofu/setup-opentofu).'
+        type: string
+        default: 'latest'
+
+jobs:
+  detect:
+    name: detect changed workspaces
+    runs-on: ubuntu-latest
+    outputs:
+      workspaces: ${{ steps.detect.outputs.workspaces }}
+      empty: ${{ steps.detect.outputs.empty }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Need both base and head SHAs accessible to git diff
+          fetch-depth: 0
+
+      - id: detect
+        name: Diff PR vs base, extract changed workspace names
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TOFU_ROOT: ${{ inputs.tofu-root }}
+        run: |
+          set -euo pipefail
+          ROOT="${TOFU_ROOT%/}"
+
+          # List paths under $ROOT/ that changed between base and head.
+          # Take the first path component after $ROOT/ — that's the
+          # workspace directory. Deduplicate.
+          WS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- "$ROOT/" \
+            | awk -v root="$ROOT" '
+                {
+                  sub("^"root"/", "", $0)
+                  split($0, parts, "/")
+                  if (parts[1] != "") print parts[1]
+                }
+              ' \
+            | sort -u)
+
+          echo "Changed workspaces:"
+          echo "$WS" | sed 's/^/  /'
+
+          if [ -z "$WS" ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo 'workspaces=[]' >> "$GITHUB_OUTPUT"
+          else
+            JSON=$(echo "$WS" | jq -R . | jq -s -c .)
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+            echo "workspaces=$JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+  plan:
+    name: 'plan: ${{ matrix.workspace }}'
+    needs: detect
+    if: needs.detect.outputs.empty == 'false'
+    strategy:
+      # One workspace failing shouldn't kill plans for the others.
+      fail-fast: false
+      matrix:
+        workspace: ${{ fromJSON(needs.detect.outputs.workspaces) }}
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@592200bd4b9bbf4772ace78f887668b1aee8f716 # v1.0.5
+        with:
+          tofu_version: ${{ inputs.tofu-version }}
+          tofu_wrapper: false
+
+      - name: tofu init
+        working-directory: ${{ inputs.tofu-root }}${{ matrix.workspace }}
+        run: tofu init -input=false -no-color
+
+      - id: plan
+        name: tofu plan
+        working-directory: ${{ inputs.tofu-root }}${{ matrix.workspace }}
+        run: |
+          set +e  # tofu plan returns 2 when there are changes — that's not failure
+          tofu plan -no-color -detailed-exitcode -input=false 2>&1 | tee /tmp/plan.txt
+          EXIT=${PIPESTATUS[0]}
+          set -e
+
+          # GitHub PR comment limit ≈ 65k chars. Trim the plan output
+          # to ~58k so we have room for the markdown wrapper.
+          tail -c 58000 /tmp/plan.txt > /tmp/plan-trimmed.txt
+          TRIMMED=$(wc -c < /tmp/plan-trimmed.txt)
+          ORIG=$(wc -c < /tmp/plan.txt)
+          if [ "$TRIMMED" -lt "$ORIG" ]; then
+            echo "(plan output trimmed: $ORIG → $TRIMMED bytes)" >&2
+            { echo "(plan output trimmed: showing last $TRIMMED of $ORIG bytes)"; echo "..."; cat /tmp/plan-trimmed.txt; } > /tmp/plan-final.txt
+          else
+            cp /tmp/plan-trimmed.txt /tmp/plan-final.txt
+          fi
+
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+
+      - name: Post plan as PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          WS: ${{ matrix.workspace }}
+          STATUS: ${{ steps.plan.outputs.exit_code }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          case "$STATUS" in
+            0) EMOJI="✅"; SUMMARY="No changes" ;;
+            2) EMOJI="📝"; SUMMARY="Changes detected" ;;
+            *) EMOJI="❌"; SUMMARY="Plan failed (exit $STATUS)" ;;
+          esac
+
+          # Use a marker comment so subsequent runs on the same PR
+          # update-in-place rather than spamming new comments.
+          MARKER="<!-- tofu-plan-action: ${WS} -->"
+
+          BODY=$(cat <<EOF_COMMENT
+          ${MARKER}
+          ### ${EMOJI} \`tofu plan\` — \`${WS}\` — ${SUMMARY}
+
+          <details><summary>Plan output</summary>
+
+          \`\`\`hcl
+          $(cat /tmp/plan-final.txt)
+          \`\`\`
+
+          </details>
+
+          <sub>Posted by [tofu-plan-action](https://github.com/darren-iac/tofu-plan-action) for commit \`${{ github.event.pull_request.head.sha }}\`.</sub>
+          EOF_COMMENT
+          )
+
+          # Find existing marker comment, update if present, else create.
+          EXISTING=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" \
+              -f body="$BODY"
+            echo "Updated comment ${EXISTING}"
+          else
+            gh pr comment "$PR" --repo "$REPO" --body "$BODY"
+            echo "Posted new comment"
+          fi
+
+      - name: Fail step on plan error (preserve comment-post behavior)
+        if: steps.plan.outputs.exit_code != '0' && steps.plan.outputs.exit_code != '2'
+        run: |
+          echo "::error::tofu plan exited ${{ steps.plan.outputs.exit_code }} for workspace ${{ matrix.workspace }}"
+          exit 1
