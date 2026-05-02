@@ -169,14 +169,39 @@ runs:
         EOF_COMMENT
             )
 
-            EXISTING=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-              --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" 2>/dev/null | head -1 || echo "")
+            # Use curl + python3 (universally available on GHA runners
+            # incl. ARC images) instead of gh CLI which isn't installed
+            # by default on minimal ARC runner images.
+            BODY_JSON=$(python3 -c 'import json,sys; print(json.dumps({"body": sys.stdin.read()}))' <<< "$BODY")
+
+            EXISTING=$(curl -fsS \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$PR/comments?per_page=100" \
+              | python3 -c "
+            import json, sys
+            comments = json.load(sys.stdin)
+            for c in comments:
+                if '$MARKER' in c.get('body',''):
+                    print(c['id'])
+                    break
+            " 2>/dev/null | head -1 || echo "")
 
             if [ -n "$EXISTING" ]; then
-              gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" -f body="$BODY" >/dev/null
+              curl -fsS -X PATCH \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$REPO/issues/comments/$EXISTING" \
+                -d "$BODY_JSON" >/dev/null
               echo "Updated comment $EXISTING for workspace $WS"
             else
-              gh pr comment "$PR" --repo "$REPO" --body "$BODY" >/dev/null
+              curl -fsS -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$REPO/issues/$PR/comments" \
+                -d "$BODY_JSON" >/dev/null
               echo "Posted new comment for workspace $WS"
             fi
 
