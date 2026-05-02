@@ -1,0 +1,202 @@
+name: 'tofu-plan'
+description: 'Detect changed tofu workspaces, run tofu plan for each, post idempotent PR comments'
+author: 'darren-iac'
+branding:
+  icon: 'file-text'
+  color: 'purple'
+
+inputs:
+  tofu-root:
+    description: 'Root directory containing tofu workspaces (relative to repo root). Trailing slash optional.'
+    required: false
+    default: 'tofu/'
+  tofu-version:
+    description: 'OpenTofu version to install (passed to opentofu/setup-opentofu).'
+    required: false
+    default: 'latest'
+  workspaces:
+    description: 'Comma-separated list of workspaces to plan, overriding auto-detection. Useful when you want to force-plan a specific workspace.'
+    required: false
+    default: ''
+  github-token:
+    description: 'Token used to post PR comments. Defaults to github.token (the workflow token, which needs `pull-requests: write`).'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  workspaces:
+    description: 'Newline-separated list of workspaces that were planned'
+    value: ${{ steps.detect.outputs.workspaces }}
+  failed:
+    description: 'true if any workspace plan exited with an unrecoverable error (i.e. not 0 or 2)'
+    value: ${{ steps.run.outputs.failed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup OpenTofu
+      uses: opentofu/setup-opentofu@592200bd4b9bbf4772ace78f887668b1aee8f716 # v1.0.5
+      with:
+        tofu_version: ${{ inputs.tofu-version }}
+        tofu_wrapper: false
+
+    - name: Detect changed workspaces
+      id: detect
+      shell: bash
+      env:
+        TOFU_ROOT: ${{ inputs.tofu-root }}
+        EXPLICIT: ${{ inputs.workspaces }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        ROOT="${TOFU_ROOT%/}"
+
+        if [ -n "$EXPLICIT" ]; then
+          WS=$(echo "$EXPLICIT" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort -u | grep -v '^$' || true)
+        elif [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+          WS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- "$ROOT/" \
+            | awk -v root="$ROOT" '
+                {
+                  sub("^"root"/", "", $0)
+                  split($0, parts, "/")
+                  if (parts[1] != "") print parts[1]
+                }
+              ' \
+            | sort -u)
+        else
+          echo "::warning::Not running on a pull_request event and no explicit `workspaces` input — nothing to plan."
+          WS=""
+        fi
+
+        echo "Workspaces to plan:"
+        if [ -n "$WS" ]; then
+          echo "$WS" | sed 's/^/  /'
+        else
+          echo "  (none)"
+        fi
+
+        {
+          echo 'workspaces<<EOF_WS_OUT'
+          echo "$WS"
+          echo 'EOF_WS_OUT'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Plan + comment per workspace
+      id: run
+      shell: bash
+      env:
+        WORKSPACES: ${{ steps.detect.outputs.workspaces }}
+        TOFU_ROOT: ${{ inputs.tofu-root }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        # Intentionally NOT `set -e` — we want to keep iterating on
+        # workspace failures so every workspace gets a comment, even if
+        # one of them errors out.
+        set -uo pipefail
+        ROOT="${TOFU_ROOT%/}"
+        FAILED_OVERALL=0
+
+        if [ -z "$WORKSPACES" ]; then
+          echo "No workspaces to plan."
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ -z "${PR:-}" ]; then
+          echo "::error::Action expects to run on a pull_request event (no github.event.pull_request.number)."
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        while IFS= read -r WS; do
+          [ -z "$WS" ] && continue
+          echo "::group::tofu plan: $WS"
+
+          DIR="$ROOT/$WS"
+          if [ ! -d "$DIR" ]; then
+            echo "::warning::workspace dir not found: $DIR — skipping"
+            echo "::endgroup::"
+            continue
+          fi
+
+          (
+            cd "$DIR"
+
+            STATUS=0
+            if ! tofu init -input=false -no-color 2>&1 | tee /tmp/init.txt; then
+              STATUS=255
+              cp /tmp/init.txt /tmp/plan.txt
+              echo "[init failed — see init output above]" >> /tmp/plan.txt
+            else
+              tofu plan -no-color -detailed-exitcode -input=false 2>&1 | tee /tmp/plan.txt
+              STATUS=${PIPESTATUS[0]}
+            fi
+
+            tail -c 58000 /tmp/plan.txt > /tmp/plan-trimmed.txt 2>/dev/null || echo "(no plan output)" > /tmp/plan-trimmed.txt
+            ORIG=$(wc -c < /tmp/plan.txt 2>/dev/null || echo 0)
+            TRIM=$(wc -c < /tmp/plan-trimmed.txt 2>/dev/null || echo 0)
+
+            if [ "$TRIM" -lt "$ORIG" ]; then
+              { echo "(plan output trimmed: showing last $TRIM of $ORIG bytes)"; echo "..."; cat /tmp/plan-trimmed.txt; } > /tmp/plan-final.txt
+            else
+              cp /tmp/plan-trimmed.txt /tmp/plan-final.txt
+            fi
+
+            case "$STATUS" in
+              0) EMOJI="✅"; SUMMARY="No changes" ;;
+              2) EMOJI="📝"; SUMMARY="Changes detected" ;;
+              *) EMOJI="❌"; SUMMARY="Plan failed (exit $STATUS)" ;;
+            esac
+
+            MARKER="<!-- tofu-plan-action: $WS -->"
+            BODY=$(cat <<EOF_COMMENT
+        $MARKER
+        ### $EMOJI \`tofu plan\` — \`$WS\` — $SUMMARY
+
+        <details><summary>Plan output</summary>
+
+        \`\`\`hcl
+        $(cat /tmp/plan-final.txt)
+        \`\`\`
+
+        </details>
+
+        <sub>Posted by [tofu-plan-action](https://github.com/darren-iac/tofu-plan-action) for commit \`$HEAD_SHA\`.</sub>
+        EOF_COMMENT
+            )
+
+            EXISTING=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" 2>/dev/null | head -1 || echo "")
+
+            if [ -n "$EXISTING" ]; then
+              gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" -f body="$BODY" >/dev/null
+              echo "Updated comment $EXISTING for workspace $WS"
+            else
+              gh pr comment "$PR" --repo "$REPO" --body "$BODY" >/dev/null
+              echo "Posted new comment for workspace $WS"
+            fi
+
+            exit "$STATUS"
+          )
+          SUBSHELL_STATUS=$?
+
+          # Treat 0 (no changes) and 2 (changes detected) as success.
+          # Anything else is a real plan failure.
+          if [ "$SUBSHELL_STATUS" != "0" ] && [ "$SUBSHELL_STATUS" != "2" ]; then
+            echo "::error::workspace $WS: tofu plan failed (exit $SUBSHELL_STATUS)"
+            FAILED_OVERALL=1
+          fi
+
+          echo "::endgroup::"
+        done <<< "$WORKSPACES"
+
+        if [ "$FAILED_OVERALL" = "1" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          exit 1
+        else
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+        fi

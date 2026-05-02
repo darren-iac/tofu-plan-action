@@ -1,14 +1,14 @@
 # tofu-plan-action
 
-Reusable GitHub Actions workflow that runs `tofu plan` for every workspace touched by a pull request and posts the diff as an idempotent PR comment per workspace.
+Composite GitHub Action that runs `tofu plan` for every workspace touched by a pull request and posts the diff as an idempotent PR comment per workspace.
 
 Designed for the OpenTofu monorepo pattern where each `<tofu-root>/<workspace>/` directory is an independent workspace with its own backend.
 
-## Why
+## Why composite, not reusable workflow
 
-`flux-iac/tofu-controller`'s [BranchPlanner](https://flux-iac.github.io/tofu-controller/branch-planner/branch-planner-getting-started/) does this in-cluster, but its long-lived pod design conflicts with Vault dynamic-secret lease lifecycle (the github plugin's child leases cascade-revoke when ESO's auth lease cycles, killing the token at GitHub's side). This action moves the work to ephemeral GHA runners that mint creds, plan, post, and exit before any cascade matters.
+The first cut of this action was a reusable workflow (`workflow_call`). It worked for detection + planning, but the credentials story didn't survive contact with reality: reusable workflows can't share env with the calling job, so the only way to get cloud creds into `tofu plan` was for the runner to have ambient creds — which most ARC runners don't. Switching to a composite action means callers can mint creds in pre-steps within the same job, share env with the action, and the action just runs `tofu`.
 
-See the originating debug session: [darren-iac/iac docs/ROADMAP.md → BranchPlanner outcome](https://github.com/darren-iac/iac/blob/main/docs/ROADMAP.md).
+See [darren-iac/iac docs/ROADMAP.md → BranchPlanner outcome](https://github.com/darren-iac/iac/blob/main/docs/ROADMAP.md) for the upstream context (we tried in-cluster BranchPlanner first; ESO + Vault dynamic-secret cascade-revoke killed it).
 
 ## Usage
 
@@ -22,47 +22,81 @@ on:
     types: [opened, synchronize, reopened]
 
 permissions:
-  pull-requests: write
+  pull-requests: write   # required: how the action posts comments
   contents: read
 
 jobs:
   plan:
-    uses: darren-iac/tofu-plan-action/.github/workflows/plan.yaml@v0
-    with:
-      tofu-root: tofu/                    # default
-      runner: arc-runner-darren-iac       # any self-hosted runner with creds
-      tofu-version: latest                # default
+    runs-on: arc-runners-darren-iac
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # action diffs PR head against base — needs both
+
+      # === YOUR CREDENTIAL MINT STEPS GO HERE ===
+      # The action runs `tofu init` + `tofu plan` and expects:
+      #   - cloud-provider creds in env (e.g. AWS_SHARED_CREDENTIALS_FILE)
+      #   - github provider tokens (if any tofu workspace uses the github provider)
+      #   - backend access (S3 + DynamoDB locking, GCS, etc)
+      #
+      # Mint these however your runner can — vault-agent annotations on
+      # the runner pod, OIDC → cloud, OpenBao via composite action, etc.
+      # The action stays neutral.
+
+      - uses: darren-iac/tofu-plan-action@v1
+        with:
+          tofu-root: tofu/                # default
+          # tofu-version: latest          # default
+          # workspaces: ''                # default: auto-detect from PR diff
 ```
 
-## Caller contract
+## Inputs
 
-- **Permissions** — the calling workflow must grant `pull-requests: write` so the comment can be posted via the default `GITHUB_TOKEN`.
-- **Credentials** — `tofu plan` itself needs cloud-provider creds (AWS, GitHub provider tokens, Cloudflare, etc). This action does **not** mint those — it expects them to already be available on the runner. For an in-cluster ARC runner with vault-agent annotations, the runner has `/vault/secrets/aws-credentials`, `/vault/secrets/github-token`, etc. mounted at startup and the workspace's `providers.tf` reads from those paths. See [darren-iac/iac/tofu/coder/providers.tf](https://github.com/darren-iac/iac/blob/main/tofu/coder/providers.tf) for an example.
-- **Backend access** — the runner needs network access to the workspace's S3/DynamoDB backend (or whatever backend is configured).
+| Input | Default | Description |
+|---|---|---|
+| `tofu-root` | `tofu/` | Root directory containing workspaces. Trailing slash optional. |
+| `tofu-version` | `latest` | OpenTofu version (passed to `opentofu/setup-opentofu`). |
+| `workspaces` | `''` (auto) | Comma-separated explicit list. Overrides PR-diff auto-detection. |
+| `github-token` | `${{ github.token }}` | Token for posting PR comments. Default needs `pull-requests: write`. |
+
+## Outputs
+
+| Output | Description |
+|---|---|
+| `workspaces` | Newline-separated list of workspaces planned |
+| `failed` | `true` if any workspace's plan exited with an unrecoverable error (init or plan crash, not "changes detected") |
 
 ## Behavior
 
-1. **detect** job (always on `ubuntu-latest`) diffs the PR head against base, extracts the first path component under `tofu-root` for every changed file, deduplicates. Skips the plan job if no workspaces changed.
-2. **plan** job (matrix per changed workspace, on `runner`) runs `tofu init && tofu plan -detailed-exitcode` in each `<tofu-root>/<workspace>/` directory.
-3. **comment** step looks for a marker-comment on the PR for that workspace; updates in-place if found, posts new otherwise. Output is wrapped in a collapsible `<details>` block with a syntax-highlighted code fence.
+1. Set up OpenTofu on the runner.
+2. Diff the PR (or read explicit `workspaces` input) → list of workspace directories under `tofu-root/`.
+3. For each workspace:
+   - `cd <tofu-root>/<workspace>`
+   - `tofu init` (skip if init fails — record the failure)
+   - `tofu plan -detailed-exitcode -no-color`
+   - Build a comment body:
+     - Status emoji: ✅ no changes (exit 0), 📝 changes (exit 2), ❌ failed (other)
+     - Plan output in a collapsible `<details>` block, syntax-highlighted, tail-trimmed if >58kB
+     - Marker: `<!-- tofu-plan-action: <workspace> -->`
+   - Find existing marker comment on the PR — update in place if found, post new otherwise.
+4. Exit 1 (action fails) if any workspace had an unrecoverable error; otherwise exit 0.
 
-Marker format: `<!-- tofu-plan-action: <workspace> -->` — one comment per workspace per PR.
+## Status indicators
 
-## Comment status indicators
+| Emoji | Meaning | tofu plan exit |
+|---|---|---|
+| ✅ | No changes | 0 |
+| 📝 | Changes detected | 2 |
+| ❌ | Plan failed | other |
 
-| Emoji | Meaning |
-|---|---|
-| ✅ | No changes (`tofu plan` exit 0) |
-| 📝 | Changes detected (`tofu plan` exit 2) |
-| ❌ | Plan failed (any other exit) — the workflow step also fails so branch protection can block the merge |
-
-## Output trimming
-
-GitHub PR comments cap at ~65kB. Plans larger than ~58kB are tail-trimmed with a leading note. Trimming preserves the most-recent (and usually most informative) part of the output.
+A failure on one workspace doesn't skip planning the others — every changed workspace gets a comment.
 
 ## Versioning
 
-Tags follow `v0`, `v1`, etc. with `vN` floating to the latest patch. Pin to `@v0` for current behavior; we'll update the major when behavior changes.
+- `v1` (current) — composite action, multi-workspace detection, idempotent comments.
+- `v0` — initial reusable-workflow shape (deprecated; see "Why composite" above).
+
+`vN` floats to the latest minor/patch on that major. Pin to `@v1` for current behavior.
 
 ## License
 
